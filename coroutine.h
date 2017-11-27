@@ -102,12 +102,7 @@ public:
     fulfiller->rejectIfThrows([e = mv(e)] { std::rethrow_exception(mv(e)); });
   }
 
-  ~CoroutineImplBase() { adapter->coroutine = nullptr; }
-  // The implementation object (*this) lives inside the coroutine's frame, so if it is being
-  // destroyed, then that means the frame is being destroyed. Since the frame might be destroyed
-  // *before* the adapter (e.g., the coroutine resumes from its last suspension point before the
-  // user destroys the owning promise), we need to tell the adapter not to try to double-free the
-  // frame.
+  ~CoroutineImplBase();
 
 protected:
   friend struct CoroutineAdapter;
@@ -119,12 +114,12 @@ protected:
 template <typename T>
 class CoroutineImpl: public CoroutineImplBase<T> {
 public:
-  void return_value(T&& value) { fulfiller->fulfill(mv(value)); }
+  void return_value(T&& value) { this->fulfiller->fulfill(mv(value)); }
 };
 template <>
 class CoroutineImpl<void>: public CoroutineImplBase<void> {
 public:
-  void return_void() { fulfiller->fulfill(); }
+  void return_void() { this->fulfiller->fulfill(); }
 };
 // The Coroutines TS has no `_::FixVoid<T>` equivalent to unify valueful and valueless co_return
 // statements, so these return_* functions must live in separate types.
@@ -132,8 +127,7 @@ public:
 struct CoroutineAdapter {
   template <typename T>
   CoroutineAdapter(PromiseFulfiller<T>& f, CoroutineImplBase<T>& impl)
-      : coroutine(std::experimental::coroutine_handle<>::from_address(&impl))
-  {
+      : coroutine(std::experimental::coroutine_handle<>::from_address(static_cast<void*>(&impl))) {
     impl.adapter = this;
     impl.fulfiller = &f;
   }
@@ -144,6 +138,14 @@ struct CoroutineAdapter {
 
   std::experimental::coroutine_handle<> coroutine;
 };
+
+template <typename T>
+CoroutineImplBase<T>::~CoroutineImplBase() { adapter->coroutine = nullptr; }
+// The implementation object (*this) lives inside the coroutine's frame, so if it is being
+// destroyed, then that means the frame is being destroyed. Since the frame might be destroyed
+// *before* the adapter (e.g., the coroutine resumes from its last suspension point before the
+// user destroys the owning promise), we need to tell the adapter not to try to double-free the
+// frame.
 
 }  // namespace _ (private)
 }  // namespace kj
