@@ -142,9 +142,12 @@ Promise<void> httpClient(AsyncIoContext& io) {
   KJ_EXPECT(location == "https://capnproto.org/");
 
   auto body = co_await response.body->readAllText();
+
+#if _MSC_VER
   co_return;
   // If I comment out the previous co_return, I don't need this one. If I comment out
   // this co_return, return_void() is never called and the program hangs.
+#endif
 }
 
 KJ_TEST("HttpClient to capnproto.org with a coroutine") {
