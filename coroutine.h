@@ -104,6 +104,12 @@ public:
 
   ~CoroutineImplBase();
 
+  CoroutineAdapter* getAdapter() { return adapter; }
+  // TODO(cleanup): Rename to `Event* getResumeEvent()`?
+  // TODO(now): What happens when an adapter is destroyed before the coroutine is finished? Could
+  //   the destructing frame cause another promise to be destroyed, in turn arming the adapter?
+  //   Test.
+
 protected:
   friend struct CoroutineAdapter;
   CoroutineAdapter* adapter;
@@ -124,10 +130,13 @@ public:
 // The Coroutines TS has no `_::FixVoid<T>` equivalent to unify valueful and valueless co_return
 // statements, so these return_* functions must live in separate types.
 
-struct CoroutineAdapter {
+struct CoroutineAdapter: Event {
   template <typename T>
   CoroutineAdapter(PromiseFulfiller<T>& f, CoroutineImplBase<T>& impl)
-      : coroutine(std::experimental::coroutine_handle<>::from_address(static_cast<void*>(&impl))) {
+      // TODO(cleanup): We should be able to initialize this coroutine_handle member using
+      //   from_address(), but that causes a segfault in coroutine.resume() with clang 5.0.
+      : coroutine(std::experimental::coroutine_handle<CoroutineImpl<T>>::from_promise(
+            static_cast<CoroutineImpl<T>&>(impl))) {
     impl.adapter = this;
     impl.fulfiller = &f;
   }
@@ -135,6 +144,14 @@ struct CoroutineAdapter {
   ~CoroutineAdapter() noexcept(false) { if (coroutine) { coroutine.destroy(); } }
   // If a coroutine runs to completion, its frame will already have been destroyed by the time the
   // adapter is destroyed, so this if-condition will almost always be falsey.
+
+  Maybe<Own<Event>> fire() override {
+    // CoroutineAdapter is an Event rather than CoroutineImpl because CoroutineImpl can be destroyed
+    // in the body of `coroutine.resume()`, which would call ~Event(), which would throw because
+    // it's being fired.
+    coroutine.resume();
+    return nullptr;
+  }
 
   std::experimental::coroutine_handle<> coroutine;
 };
@@ -167,6 +184,20 @@ namespace std {
 // expression type.
 
 namespace kj {
+
+// We need a way to access a Promise<T>'s PromiseNode pointer. That requires friend access.
+// Fortunately, Promise<T> and its base class give away friendship to all specializations of
+// Promise<T>! :D
+//
+// TODO(cleanup): Either formalize a public promise node API or gain real friendship, e.g. with
+//   tighter integration into kj/async.h.
+namespace _ { struct FriendHack; }
+template <>
+struct Promise<_::FriendHack> {
+  template <typename T>
+  static _::PromiseNode& getNode(Promise<T>& p) { return *p.node; }
+};
+
 namespace _ {
 
 template <typename T>
@@ -175,8 +206,11 @@ public:
   PromiseAwaiter(Promise<T>&& p): promise(mv(p)) {}
 
   bool await_ready() const { return false; }
+  // TODO(someday): Return "`promise.node.get()` is safe to call".
 
   T await_resume() {
+    Promise<_::FriendHack>::getNode(promise).get(result);
+
     // Copied from Promise::wait() implementation.
     KJ_IF_MAYBE(value, result.value) {
       KJ_IF_MAYBE(exception, result.exception) {
@@ -191,37 +225,17 @@ public:
     }
   }
 
-  void await_suspend(std::experimental::coroutine_handle<> c) {
-    promise2 = promise.then(onValue(c), onException(c)).eagerlyEvaluate(nullptr);
+  template <typename U>
+  void await_suspend(std::experimental::coroutine_handle<CoroutineImpl<U>> c) {
+    // U is the return type of the currently active coroutine, whereas T is the return type of the
+    // Promise we're waiting on (which may or may not be implemented using a coroutine).
+    Promise<_::FriendHack>::getNode(promise).onReady(c.promise().getAdapter());
   }
 
 private:
-  auto onValue(std::experimental::coroutine_handle<> c) {
-    return [this, c](T&& r) { return resume(c, mv(r)); };
-  }
-  auto onException(std::experimental::coroutine_handle<> c) {
-    return [this, c](Exception&& e) { return resume(c, {false, mv(e)}); };
-  }
-
-  Promise<void> resume(std::experimental::coroutine_handle<> c, ExceptionOr<FixVoid<T>>&& r) {
-    result = mv(r);
-    KJ_DEFER(c.resume());
-    return mv(promise2);
-    // We are currently executing in a `promise2.then()` continuation, but `c.resume()` destroys
-    // `this`, which owns `promise2`. Since that would lead to undefined behavior, return `promise2`
-    // instead.
-  }
-
   Promise<T> promise;
-  Promise<void> promise2{NEVER_DONE};
   ExceptionOr<FixVoid<T>> result;
 };
-
-template <>
-inline auto PromiseAwaiter<void>::onValue(std::experimental::coroutine_handle<> c) {
-  // Special case for `Promise<void>`.
-  return [this, c]() { return resume(c, Void{}); };
-}
 
 }  // namespace _ (private)
 
