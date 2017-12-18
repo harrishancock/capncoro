@@ -56,13 +56,13 @@
 #ifdef KJ_HAVE_COROUTINE
 
 // =======================================================================================
-// CoroutineImpl
+// Coroutine
 //
 // When the compiler sees that a function is implemented as a coroutine (i.e., it contains a co_*
 // keyword), it looks up the function's return type in a traits class:
-// 
+//
 //   std::experimentalL::coroutine_traits<kj::Promise<T>, Args...>::promise_type
-//       = kj::_::CoroutineImpl<T>
+//       = kj::_::Coroutine<T>
 //
 // The standard calls this the `promise_type` object. I'd prefer to call it the "coroutine
 // implementation object" since the word promise means different things in KJ and std styles. This
@@ -84,11 +84,9 @@ namespace _ {
 struct CoroutineAdapter;
 
 template <typename T>
-class CoroutineImplBase {
+class CoroutineBase {
 public:
-  Promise<T> get_return_object() {
-    return newAdaptedPromise<T, CoroutineAdapter>(*this);
-  }
+  Promise<T> get_return_object();
 
   auto initial_suspend() { return std::experimental::suspend_never{}; }
   auto final_suspend() { return std::experimental::suspend_never{}; }
@@ -106,10 +104,9 @@ public:
     fulfiller->rejectIfThrows([e = mv(e)] { std::rethrow_exception(mv(e)); });
   }
 
-  ~CoroutineImplBase();
+  ~CoroutineBase();
 
-  CoroutineAdapter* getAdapter() { return adapter; }
-  // TODO(cleanup): Rename to `Event* getResumeEvent()`?
+  Event* getResumeEvent();
   // TODO(now): What happens when an adapter is destroyed before the coroutine is finished? Could
   //   the destructing frame cause another promise to be destroyed, in turn arming the adapter?
   //   Test.
@@ -122,12 +119,12 @@ protected:
 };
 
 template <typename T>
-class CoroutineImpl: public CoroutineImplBase<T> {
+class Coroutine: public CoroutineBase<T> {
 public:
   void return_value(T&& value) { this->fulfiller->fulfill(mv(value)); }
 };
 template <>
-class CoroutineImpl<void>: public CoroutineImplBase<void> {
+class Coroutine<void>: public CoroutineBase<void> {
 public:
   void return_void() { this->fulfiller->fulfill(); }
 };
@@ -136,21 +133,19 @@ public:
 
 struct CoroutineAdapter: Event {
   template <typename T>
-  CoroutineAdapter(PromiseFulfiller<T>& f, CoroutineImplBase<T>& impl)
-      // TODO(cleanup): We should be able to initialize this coroutine_handle member using
-      //   from_address(), but that causes a segfault in coroutine.resume() with clang 5.0.
-      : coroutine(std::experimental::coroutine_handle<CoroutineImpl<T>>::from_promise(
-            static_cast<CoroutineImpl<T>&>(impl))) {
-    impl.adapter = this;
-    impl.fulfiller = &f;
+  CoroutineAdapter(PromiseFulfiller<T>& f,
+                   std::experimental::coroutine_handle<Coroutine<T>> c)
+      : coroutine(c) {
+    c.promise().adapter = this;
+    c.promise().fulfiller = &f;
   }
 
   ~CoroutineAdapter() noexcept(false) { if (coroutine) { coroutine.destroy(); } }
   // If a coroutine runs to completion, its frame will already have been destroyed by the time the
-  // adapter is destroyed, so this if-condition will almost always be falsey.
+  // adapter is destroyed, so this if-condition will almost always be false.
 
   Maybe<Own<Event>> fire() override {
-    // CoroutineAdapter is an Event rather than CoroutineImpl because CoroutineImpl can be destroyed
+    // CoroutineAdapter is an Event rather than Coroutine because Coroutine can be destroyed
     // in the body of `coroutine.resume()`, which would call ~Event(), which would throw because
     // it's being fired.
     coroutine.resume();
@@ -161,7 +156,16 @@ struct CoroutineAdapter: Event {
 };
 
 template <typename T>
-CoroutineImplBase<T>::~CoroutineImplBase() { adapter->coroutine = nullptr; }
+Promise<T> CoroutineBase<T>::get_return_object() {
+  using Handle = std::experimental::coroutine_handle<Coroutine<T>>;
+  auto coroutine = Handle::from_promise(*static_cast<Coroutine<T>*>(this));
+  return newAdaptedPromise<T, CoroutineAdapter>(*this, coroutine);
+}
+
+Event* CoroutineBase::getResumeEvent() { return adapter; }
+
+template <typename T>
+CoroutineBase<T>::~CoroutineBase() { adapter->coroutine = nullptr; }
 // The implementation object (*this) lives inside the coroutine's frame, so if it is being
 // destroyed, then that means the frame is being destroyed. Since the frame might be destroyed
 // *before* the adapter (e.g., the coroutine resumes from its last suspension point before the
@@ -175,7 +179,7 @@ namespace std {
   namespace experimental {
     template <class T, class... Args>
     struct coroutine_traits<kj::Promise<T>, Args...> {
-      using promise_type = kj::_::CoroutineImpl<T>;
+      using promise_type = kj::_::Coroutine<T>;
     };
   }  // namespace experimental
 }  // namespace std
@@ -183,7 +187,7 @@ namespace std {
 // =======================================================================================
 // co_await kj::Promise implementation
 //
-// The above `CoroutineImpl` type allows functions returning `kj::Promise<T>` to use coroutine
+// The above `Coroutine` type allows functions returning `kj::Promise<T>` to use coroutine
 // syntax. This only buys us `co_return`, though: `co_await` requires further integration with its
 // expression type.
 
@@ -213,7 +217,8 @@ public:
   // TODO(someday): Return "`promise.node.get()` is safe to call".
 
   T await_resume() {
-    Promise<_::FriendHack>::getNode(promise).get(result);
+    ExceptionOr<FixVoid<T>> result;
+    getNode().get(result);
 
     // Copied from Promise::wait() implementation.
     KJ_IF_MAYBE(value, result.value) {
@@ -230,15 +235,15 @@ public:
   }
 
   template <typename U>
-  void await_suspend(std::experimental::coroutine_handle<CoroutineImpl<U>> c) {
+  void await_suspend(std::experimental::coroutine_handle<Coroutine<U>> c) {
     // U is the return type of the currently active coroutine, whereas T is the return type of the
     // Promise we're waiting on (which may or may not be implemented using a coroutine).
-    Promise<_::FriendHack>::getNode(promise).onReady(c.promise().getAdapter());
+    getNode().onReady(c.promise().getResumeEvent());
   }
 
 private:
   Promise<T> promise;
-  ExceptionOr<FixVoid<T>> result;
+  PromiseNode& getNode() { return Promise<_::FriendHack>::getNode(promise); }
 };
 
 }  // namespace _ (private)
