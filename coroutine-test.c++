@@ -31,24 +31,63 @@ namespace {
 
 #ifdef KJ_HAVE_COROUTINE
 
-Promise<int> simpleCoroutine(bool dontThrow = true) {
-  KJ_ASSERT(dontThrow);
-  co_await Promise<void>(READY_NOW);
-  co_return 123;
+KJ_TEST("Identity coroutine") {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  auto identity = [](auto&& x) -> kj::Promise<kj::Decay<decltype(x)>> {
+    co_return kj::fwd<decltype(x)>(x);
+  };
+
+  KJ_EXPECT(identity(123).wait(waitScope) == 123);
+  KJ_EXPECT(*identity(kj::heap(456)).wait(waitScope) == 456);
+
+  {
+    auto p = identity("we can cancel the coroutine");
+  }
+}
+
+Promise<int> simpleCoroutine(kj::Promise<int> result, kj::Promise<bool> dontThrow = true) {
+  KJ_ASSERT(co_await dontThrow);
+  co_return co_await result;
 }
 
 KJ_TEST("Simple coroutine test") {
   EventLoop loop;
   WaitScope waitScope(loop);
 
-  KJ_EXPECT(simpleCoroutine().wait(waitScope) == 123);
+  KJ_EXPECT(simpleCoroutine(123).wait(waitScope) == 123);
 }
 
-KJ_TEST("Exceptions get propagated in coroutines") {
+KJ_TEST("Exceptions propagate through layered coroutines") {
   EventLoop loop;
   WaitScope waitScope(loop);
 
-  KJ_EXPECT_THROW_RECOVERABLE(FAILED, simpleCoroutine(false).wait(waitScope));
+  auto throwy = simpleCoroutine(kj::NEVER_DONE, false);
+
+  KJ_EXPECT_THROW_RECOVERABLE(FAILED, simpleCoroutine(kj::mv(throwy)).wait(waitScope));
+}
+
+KJ_TEST("Coroutines can be canceled while suspended") {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  size_t count = 0;
+
+  struct Counter {
+    size_t& count;
+    Counter(size_t& count): count(count) {}
+    ~Counter() { ++count; }
+    KJ_DISALLOW_COPY(Counter);
+  };
+
+  {
+    auto neverDone = kj::Promise<int>(kj::NEVER_DONE);
+    neverDone = neverDone.attach(kj::heap<Counter>(count));
+    auto promise = simpleCoroutine(kj::mv(neverDone));
+  }
+
+  KJ_EXPECT(count == 1);
 }
 
 Promise<void> sendData(Promise<Own<NetworkAddress>> addressPromise) {
@@ -96,7 +135,6 @@ KJ_TEST("Simple network test with chained promise implementation") {
   KJ_EXPECT("foo" == result);
 }
 
-
 KJ_TEST("Simple network test with coroutine implementation") {
   auto io = setupAsyncIo();
   auto& network = io.provider->getNetwork();
@@ -112,21 +150,12 @@ KJ_TEST("Simple network test with coroutine implementation") {
   KJ_EXPECT("foo" == result);
 }
 
-
-
 Promise<Own<AsyncIoStream>> httpClientConnect(AsyncIoContext& io) {
   auto addr = co_await io.provider->getNetwork().parseAddress("capnproto.org", 80);
   co_return co_await addr->connect();
 }
 
-Promise<void> httpClient(AsyncIoContext& io) {
-  Own<AsyncIoStream> connection;
-  try {
-    connection = co_await httpClientConnect(io);
-  } catch (const Exception&) {
-    KJ_LOG(WARNING, "skipping test because couldn't connect to capnproto.org");
-    co_return;
-  }
+Promise<void> httpClient(Own<AsyncIoStream> connection) {
   // Successfully connected to capnproto.org. Try doing GET /. We expect to get a redirect to
   // HTTPS, because what kind of horrible web site would serve in plaintext, really?
 
@@ -142,18 +171,18 @@ Promise<void> httpClient(AsyncIoContext& io) {
   KJ_EXPECT(location == "https://capnproto.org/");
 
   auto body = co_await response.body->readAllText();
-
-#if _MSC_VER
-  co_return;
-  // If I comment out the previous co_return, I don't need this one. If I comment out
-  // this co_return, return_void() is never called and the program hangs.
-#endif
 }
 
 KJ_TEST("HttpClient to capnproto.org with a coroutine") {
   auto io = setupAsyncIo();
 
-  httpClient(io).wait(io.waitScope);
+  auto promise = httpClientConnect(io).then([](Own<AsyncIoStream> connection) {
+    return httpClient(kj::mv(connection));
+  }, [](Exception&&) {
+    KJ_LOG(WARNING, "skipping test because couldn't connect to capnproto.org");
+  });
+
+  promise.wait(io.waitScope);
 }
 
 #endif  // KJ_HAVE_COROUTINE
