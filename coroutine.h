@@ -159,10 +159,11 @@ template <typename T>
 Promise<T> CoroutineBase<T>::get_return_object() {
   using Handle = std::experimental::coroutine_handle<Coroutine<T>>;
   auto coroutine = Handle::from_promise(*static_cast<Coroutine<T>*>(this));
-  return newAdaptedPromise<T, CoroutineAdapter>(*this, coroutine);
+  return newAdaptedPromise<T, CoroutineAdapter>(coroutine);
 }
 
-Event* CoroutineBase::getResumeEvent() { return adapter; }
+template <typename T>
+Event* CoroutineBase<T>::getResumeEvent() { return adapter; }
 
 template <typename T>
 CoroutineBase<T>::~CoroutineBase() { adapter->coroutine = nullptr; }
