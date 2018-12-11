@@ -55,45 +55,58 @@
 #ifdef KJ_HAVE_COROUTINE
 
 // =======================================================================================
-// Coroutine TS integration with kj::Promise<T>.
-
-namespace kj {
-
-// We need a way to access a Promise<T>'s PromiseNode pointer. That requires friend access.
-// Fortunately, Promise<T> and its base class give away friendship to all specializations of
-// Promise<T>! :D
+// Coroutines TS integration with kj::Promise<T>.
 //
-// TODO(cleanup): Either formalize a public promise node API or gain real friendship, e.g. with
-//   tighter integration into kj/async.h.
+// Here's a simple coroutine:
+//
+//   Promise<Own<AsyncIoStream>> connectToService(Network& n) {
+//     auto a = co_await n.parseAddress(IP, PORT);
+//     auto c = co_await a->connect();
+//     co_return kj::mv(c);
+//   }
+//
+// The presence of the co_await and co_return keywords tell the compiler it is a coroutine.
+// Although it looks similar to a function, it has a couple large differences. First, everything
+// that would normally live in the stack frame lives instead in a heap-based coroutine frame.
+// Second, the coroutine has the ability to return from its scope without deallocating this frame
+// (to suspend, in other words), and the ability to resume from its last suspension point.
+//
+// In order to know how to suspend, resume, and return from a coroutine, the compiler looks up a
+// coroutine implementation type via a traits class parameterized by the coroutine return and
+// parameter types. We'll name our coroutine implementation `kj::_::Coroutine<T>`,
 
-namespace _ { struct FriendHack; }
-template <>
-struct Promise<_::FriendHack> {
+namespace kj::_ {
   template <typename T>
-  static _::PromiseNode& getNode(Promise<T>& p) { return *p.node; }
-};
+  class Coroutine;
+}  // namespace kj::_ (private)
 
-namespace _ {
+// Specializing the appropriate traits class tells the compiler about `kj::_::Coroutine<T>`.
+
+namespace std::experimental {
+  template <class T, class... Args>
+  struct coroutine_traits<kj::Promise<T>, Args...> {
+    // `Args...` are the coroutine's parameter types.
+
+    using promise_type = kj::_::Coroutine<T>;
+    // The Coroutines TS calls this the "promise type". This makes sense when thinking of coroutines
+    // returning `std::future<T>`, since the coroutine implementation would be a wrapper around
+    // a `std::promise<T>`. It's extremely confusing from a KJ perspective, however, so I call it
+    // the "coroutine implementation type" instead.
+  };
+}  // namespace std::experimental
+
+// Now when the compiler sees our `connectToService()` coroutine above, it default-constructs a
+// `coroutine_traits<Promise<Own<AsyncIoStream>>, Network&>::promise_type`, or
+// `kj::_::Coroutine<Own<AsyncIoStream>>`.
+//
+// The implementation object lives in the heap-allocated coroutine frame. It gets destroyed and
+// deallocated when the frame does.
+
+namespace kj::_ {
 
 template <typename Self, typename T>
-class CoroutineBase {
-public:
-  template <typename U>
-  void return_value(U&& value) {
-    static_cast<Self*>(this)->adapter->fulfiller.fulfill(T(kj::fwd<U>(value)));
-  }
-};
-template <typename Self>
-class CoroutineBase<Self, void> {
-public:
-  void return_void() {
-    static_cast<Self*>(this)->adapter->fulfiller.fulfill();
-  }
-};
-// The Coroutines TS has no `_::FixVoid<T>` equivalent to unify valueful and valueless co_return
-// statements, and programs are ill-formed if the "coroutine promise" (Coroutine<T>) has both a
-// `return_value()` and `return_void()`. No amount of EnableIffery can get around it, so these
-// return_* functions live in a CRTP mixin.
+class CoroutineBase;
+// CRTP mixin, covered later.
 
 template <typename T>
 class Coroutine: public CoroutineBase<Coroutine<T>, T> {
@@ -165,6 +178,26 @@ private:
   // promise returned from `get_return_object()` is destroyed while this coroutine is suspended.
 };
 
+template <typename Self, typename T>
+class CoroutineBase {
+public:
+  template <typename U>
+  void return_value(U&& value) {
+    static_cast<Self*>(this)->adapter->fulfiller.fulfill(T(kj::fwd<U>(value)));
+  }
+};
+template <typename Self>
+class CoroutineBase<Self, void> {
+public:
+  void return_void() {
+    static_cast<Self*>(this)->adapter->fulfiller.fulfill();
+  }
+};
+// The Coroutines TS has no `_::FixVoid<T>` equivalent to unify valueful and valueless co_return
+// statements, and programs are ill-formed if the "coroutine promise" (Coroutine<T>) has both a
+// `return_value()` and `return_void()`. No amount of EnableIffery can get around it, so these
+// return_* functions live in a CRTP mixin.
+
 template <typename T>
 struct Coroutine<T>::Adapter: Event {
   Adapter(PromiseFulfiller<T>& f, Coroutine::Handle coroutine)
@@ -212,6 +245,30 @@ struct Coroutine<T>::Adapter: Event {
   ExceptionOrValue* result = nullptr;
   // Set by Awaiter::await_suspend().
 };
+
+
+// We need a way to access a Promise<T>'s PromiseNode pointer. That requires friend access.
+// Fortunately, Promise<T> and its base class give away friendship to all specializations of
+// Promise<T>! :D
+//
+// TODO(cleanup): Either formalize a public promise node API or gain real friendship, e.g. with
+//   tighter integration into kj/async.h.
+
+struct FriendHack;
+
+}  // namespace kj::_ (private)
+
+namespace kj {
+
+template <>
+struct Promise<_::FriendHack> {
+  template <typename T>
+  static _::PromiseNode& getNode(Promise<T>& p) { return *p.node; }
+};
+
+} //  namespace kj
+
+namespace kj::_ {
 
 template <typename T>
 template <typename U>
@@ -261,25 +318,6 @@ private:
   ExceptionOr<FixVoid<U>> result;
 };
 
-}  // namespace _ (private)
-}  // namespace kj
-
-// =======================================================================================
-// Coroutine traits glue
-//
-// When the compiler sees that a function is implemented as a coroutine (i.e., it contains a co_*
-// keyword), it looks up the function's return type in a traits class:
-//
-//   std::experimentalL::coroutine_traits<kj::Promise<T>, Args...>::promise_type
-//       = kj::_::Coroutine<T>
-
-namespace std {
-  namespace experimental {
-    template <class T, class... Args>
-    struct coroutine_traits<kj::Promise<T>, Args...> {
-      using promise_type = kj::_::Coroutine<T>;
-    };
-  }  // namespace experimental
-}  // namespace std
+}  // namespace kj::_ (private)
 
 #endif  // KJ_HAVE_COROUTINE
